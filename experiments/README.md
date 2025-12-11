@@ -35,12 +35,19 @@ This directory contains scripts to replicate the experiments from the Graphormer
    cd Graphormer
    bash install.sh
    ```
-
-2. **Install Dependencies**:
+   
+   This will install:
    - PyTorch (with CUDA support)
    - PyTorch Geometric
    - Open Graph Benchmark (OGB)
    - Fairseq (included in Graphormer)
+
+2. **Check Setup**:
+   ```bash
+   bash experiments/check_setup.sh
+   ```
+   
+   This will verify that all dependencies are installed correctly.
 
 3. **GPU Requirements**:
    - ZINC: 1 GPU recommended
@@ -142,9 +149,32 @@ python check_results.py --checkpoint-dir ../../experiments/results/zinc_graphorm
 
 ## Troubleshooting
 
-1. **Out of Memory**: Reduce batch size or use gradient accumulation
-2. **Fairseq not found**: Make sure Graphormer is installed and in PYTHONPATH
-3. **Dataset download issues**: Check internet connection and disk space
+1. **`fairseq-train: command not found`**:
+   - The scripts will automatically try `python -m fairseq_cli.train` as a fallback
+   - If that doesn't work, make sure Graphormer is installed:
+     ```bash
+     cd Graphormer
+     bash install.sh
+     ```
+   - Or add the fairseq installation to your PATH
+
+2. **`No such file or directory` for logs**:
+   - The scripts now create log directories automatically
+   - If you still see this error, check file permissions
+
+3. **Out of Memory**: 
+   - Reduce batch size in the script (e.g., `--batch-size 32` instead of 64)
+   - Or use gradient accumulation
+
+4. **Dataset download issues**: 
+   - Check internet connection and disk space
+   - Datasets are downloaded automatically on first run
+   - ZINC: ~500MB, PCQM4M: ~10GB, MolHIV: ~100MB
+
+5. **Run setup check**:
+   ```bash
+   bash experiments/check_setup.sh
+   ```
 
 ## Citation
 

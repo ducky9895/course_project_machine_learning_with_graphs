@@ -19,14 +19,27 @@ BATCH_SIZE=128
 TOT_UPDATES=$((33000*EPOCH/BATCH_SIZE/N_GPU))
 WARMUP_UPDATES=$((TOT_UPDATES*16/100))
 
-# Create directories
-mkdir -p ${SAVE_DIR}
-mkdir -p ${LOG_DIR}
-
 # Get absolute path to Graphormer
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GRAPHORMER_DIR="${SCRIPT_DIR}/../Graphormer"
 EXAMPLES_DIR="${GRAPHORMER_DIR}/examples/property_prediction"
+
+# Create directories (using absolute paths)
+mkdir -p ${SAVE_DIR}
+mkdir -p ${LOG_DIR}
+
+# Check if fairseq is installed
+if ! command -v fairseq-train &> /dev/null; then
+    echo "Error: fairseq-train not found in PATH"
+    echo "Please install Graphormer first:"
+    echo "  cd ${GRAPHORMER_DIR} && bash install.sh"
+    echo ""
+    echo "Or use: python -m fairseq_cli.train"
+    echo "Attempting to use python -m fairseq_cli.train instead..."
+    FAIRSEQ_CMD="python -m fairseq_cli.train"
+else
+    FAIRSEQ_CMD="fairseq-train"
+fi
 
 echo "=========================================="
 echo "Running OGBG-MolHIV Experiment"
@@ -40,13 +53,14 @@ echo "Epochs: ${EPOCH}"
 echo "Batch size: ${BATCH_SIZE}"
 echo "Total updates: ${TOT_UPDATES}"
 echo "Warmup updates: ${WARMUP_UPDATES}"
+echo "Fairseq command: ${FAIRSEQ_CMD}"
 echo "=========================================="
 
 # Change to Graphormer examples directory
 cd ${EXAMPLES_DIR}
 
 # Run training
-CUDA_VISIBLE_DEVICES=${CUDA_DEVICE} fairseq-train \
+CUDA_VISIBLE_DEVICES=${CUDA_DEVICE} ${FAIRSEQ_CMD} \
 --user-dir ../../graphormer \
 --num-workers 16 \
 --ddp-backend=legacy_ddp \
