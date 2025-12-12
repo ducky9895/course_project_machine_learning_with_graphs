@@ -1,0 +1,5 @@
+,accuracy,note,error
+Pure Graphormer,0.0,Model not found,
+Graphormer + Explainer,0.0,,too many values to unpack (expected 2)
+GCN,0.0,Model not found - needs training,
+GIN,0.0,Model not found - needs training,
