@@ -1,0 +1,6 @@
+Dataset,Model
+synthetic,Pure Graphormer
+synthetic,Graphormer + Explainer
+synthetic,Graphormer + Explainer + Reg
+synthetic,GCN
+synthetic,GIN

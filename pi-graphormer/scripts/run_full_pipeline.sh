@@ -35,7 +35,16 @@ if [ "${DATASET}" == "synthetic" ]; then
     echo "=========================================="
     echo "Step 1: Generate Synthetic Dataset"
     echo "=========================================="
-    bash scripts/generate_dataset.sh ${N_TRAIN} ${N_VAL} ${N_TEST}
+    
+    # Check if dataset already exists
+    DATASET_DIR="data/PT-Motifs/raw"
+    if [ -d "${DATASET_DIR}" ] && [ "$(ls -A ${DATASET_DIR} 2>/dev/null)" ]; then
+        echo "Dataset already exists at ${DATASET_DIR}"
+        echo "Skipping dataset generation. Delete ${DATASET_DIR} to regenerate."
+    else
+        echo "Generating new dataset..."
+        bash scripts/generate_dataset.sh ${N_TRAIN} ${N_VAL} ${N_TEST}
+    fi
     echo ""
 fi
 
@@ -127,12 +136,37 @@ echo "=========================================="
 # 3.1: Predictive Accuracy Comparison
 echo ""
 echo "3.1: Experiment 1 - Predictive Accuracy..."
-python scripts/eval_predictive_accuracy.py \
+# Evaluate on all available datasets
+if [ "${DATASET}" == "synthetic" ]; then
+    # For synthetic, evaluate on synthetic dataset
+    python scripts/eval_predictive_accuracy.py \
+        --checkpoint_dir chkpts/ \
+        --dataset synthetic \
+        --n_test ${N_TEST} \
+        --cuda ${CUDA_DEVICE} \
+        --output results/accuracy/synthetic_comparison.csv || echo "Warning: Synthetic accuracy evaluation failed"
+    
+    # Also try to evaluate on BA2Motif if available
+    python scripts/eval_predictive_accuracy.py \
+        --checkpoint_dir chkpts/ \
+        --dataset ba2motif \
+        --cuda ${CUDA_DEVICE} \
+        --output results/accuracy/ba2motif_comparison.csv || echo "BA2Motif dataset not available, skipping"
+else
+    # For other datasets, evaluate on that dataset
+    python scripts/eval_predictive_accuracy.py \
+        --checkpoint_dir chkpts/ \
+        --dataset ${DATASET} \
+        --n_test ${N_TEST} \
+        --cuda ${CUDA_DEVICE} \
+        --output results/accuracy/${DATASET}_comparison.csv || echo "Warning: Accuracy evaluation failed"
+fi
+
+# Combine all available results
+python scripts/eval_all_datasets.py \
     --checkpoint_dir chkpts/ \
-    --dataset ${DATASET} \
-    --n_test ${N_TEST} \
-    --cuda ${CUDA_DEVICE} \
-    --output results/accuracy/comparison.csv || echo "Warning: Accuracy evaluation failed"
+    --output_dir results/accuracy \
+    --skip_eval || echo "Could not combine results (some datasets may be missing)"
 
 # 3.2: Find best model for explainer-based evaluations
 EXPLAINER_MODEL=$(find chkpts -name "best_model.pt" -path "*/graphormer_explainer*" | head -1)

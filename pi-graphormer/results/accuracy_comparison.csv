@@ -1,5 +1,6 @@
-,accuracy,note,error
-Pure Graphormer,0.0,Model not found,
-Graphormer + Explainer,0.0,,too many values to unpack (expected 2)
-GCN,0.0,Model not found - needs training,
-GIN,0.0,Model not found - needs training,
+,accuracy,f1_macro,f1_micro,precision,recall
+Pure Graphormer,0.99,0.9898555086101973,0.99,0.9901335833036472,0.9896649380264076
+Graphormer + Explainer,1.0,1.0,1.0,1.0,1.0
+Graphormer + Explainer + Reg,1.0,1.0,1.0,1.0,1.0
+GCN,0.55,0.4773236132503867,0.55,0.531641604010025,0.5394101853474481
+GIN,0.918,0.9173718558847117,0.918,0.9187895508248413,0.9182666865709099

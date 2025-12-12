@@ -31,4 +31,4 @@ from .sbm_dataset import (
 )
 
 # Backwards compatibility alias
-GraphormerRandomizedPYGDataset = RandomizedPYGDatasets
+GraphormerRandomizedPYGDataset = RandomizedPYGDataset

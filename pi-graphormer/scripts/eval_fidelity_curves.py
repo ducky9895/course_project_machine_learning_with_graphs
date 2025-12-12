@@ -48,79 +48,136 @@ def get_random_scores(num_edges):
     return np.random.rand(num_edges)
 
 
-def evaluate_with_modified_edges(model, batched_data, pyg_batch, device, edge_mask):
+def evaluate_with_modified_edges(model, original_graphs, device, edge_masks, collator):
     """
     Evaluate model with modified edges.
     
     Args:
-        edge_mask: boolean mask of which edges to keep (True = keep, False = remove)
+        original_graphs: List of original PyG Data objects (before batching)
+        edge_masks: List of boolean masks (one per graph) indicating which edges to keep
+        collator: GraphormerCollator instance to recompute features
     """
     model.eval()
     
-    # Create new edge_index with only kept edges
-    kept_edges = edge_mask.nonzero()[0]
-    if len(kept_edges) == 0:
-        # No edges left - return random predictions
-        return torch.zeros(pyg_batch.batch.max().item() + 1, dtype=torch.long)
+    modified_graphs = []
+    for graph, edge_mask in zip(original_graphs, edge_masks):
+        # Get kept edges
+        kept_edges = edge_mask.nonzero().squeeze(1)
+        if len(kept_edges) == 0:
+            # No edges - create empty graph
+            modified_edge_index = torch.zeros((2, 0), dtype=torch.long)
+        else:
+            modified_edge_index = graph.edge_index[:, kept_edges]
+        
+        # Create new graph with modified edges
+        from torch_geometric.data import Data
+        modified_graph = Data(
+            x=graph.x.clone(),
+            edge_index=modified_edge_index,
+            y=graph.y
+        )
+        
+        # Recompute Graphormer features for modified graph
+        from data_utils import preprocess_pyg_item
+        modified_graph = preprocess_pyg_item(modified_graph, max_dist=20)
+        modified_graphs.append(modified_graph)
     
-    modified_edge_index = pyg_batch.edge_index[:, kept_edges]
-    
-    # Create new PyG batch with modified edges
-    # Note: We keep the original Graphormer features (spatial_pos, etc.)
-    # In a full implementation, you'd recompute these
-    
-    # For now, we'll evaluate using the original features but modified edge_index
-    # This is a simplification - full fidelity requires recomputing Graphormer features
+    # Collate modified graphs
+    modified_batch = collator(modified_graphs)
+    modified_batched_data = {k: v.to(device) for k, v in modified_batch['graphormer_data'].items()}
+    modified_pyg_batch = modified_batch['pyg_batch'].to(device)
     
     with torch.no_grad():
-        # Use original batched_data but note that edge structure changed
-        # This is approximate fidelity
         if isinstance(model, PureGraphormer):
-            logits = model(batched_data, pyg_batch)
+            logits = model(modified_batched_data, modified_pyg_batch)
         else:
-            logits = model(batched_data, pyg_batch, return_explanation=False)
+            logits = model(modified_batched_data, modified_pyg_batch, return_explanation=False)
         preds = logits.argmax(dim=1)
     
     return preds.cpu()
 
 
-def compute_fidelity_curve(model, loader, device, method='graphormer', ratios=np.linspace(0, 1, 21)):
+def compute_fidelity_curve(model, loader, device, method='graphormer', ratios=np.linspace(0, 1, 21), collator=None):
     """
     Compute fidelity curve by removing/adding edges.
     
     Args:
         method: 'graphormer', 'random', 'pgexplainer', 'gnnexplainer'
+        collator: GraphormerCollator instance for recomputing features
     """
-    all_accuracies = []
-    all_labels = []
+    # First pass: collect edge scores, labels, and original graphs
+    edge_scores_list = []  # List of edge scores per graph
+    labels_list = []  # List of labels per graph
+    original_graphs_list = []  # List of original PyG Data objects
     
-    # First pass: collect all edge scores and labels
-    edge_scores_list = []
-    labels_list = []
-    batched_data_list = []
-    pyg_batch_list = []
-    
-    print("Collecting edge scores...")
+    print("Collecting edge scores and extracting graphs...")
     for batch in tqdm(loader, desc="Collecting"):
         graphormer_data = {k: v.to(device) for k, v in batch['graphormer_data'].items()}
         pyg_batch = batch['pyg_batch'].to(device)
         
-        if method == 'graphormer':
-            edge_scores = get_edge_scores_for_batch(model, graphormer_data, pyg_batch, device)
-            if edge_scores is None:
-                # Model doesn't have explainer (e.g., PureGraphormer), use random
-                print(f"  Warning: Model doesn't have explainer (batch {len(edge_scores_list)}), using random scores")
-                edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
-        elif method == 'random':
-            edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
-        else:
-            # Placeholder for PGExplainer/GNNExplainer
-            edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
+        # Extract individual graphs from batch
+        batch_size = pyg_batch.batch.max().item() + 1
+        batch_edge_scores = None
         
-        edge_scores_list.append(edge_scores)
-        labels_list.append(pyg_batch.y.cpu())
-        batched_data_list.append(graphormer_data)
-        pyg_batch_list.append(pyg_batch)
+        if method == 'graphormer':
+            batch_edge_scores = get_edge_scores_for_batch(model, graphormer_data, pyg_batch, device)
+            if batch_edge_scores is None:
+                print(f"  Warning: Model doesn't have explainer, using random scores")
+                batch_edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
+            else:
+                # Debug: check if scores are meaningful
+                if len(edge_scores_list) == 0:  # First batch
+                    print(f"  Edge scores stats: min={batch_edge_scores.min():.4f}, max={batch_edge_scores.max():.4f}, "
+                          f"mean={batch_edge_scores.mean():.4f}, std={batch_edge_scores.std():.4f}")
+        elif method == 'random':
+            batch_edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
+        else:
+            batch_edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
+        
+        # Split batch into individual graphs
+        edge_idx = 0
+        for graph_idx in range(batch_size):
+            graph_mask = (pyg_batch.batch == graph_idx)
+            graph_nodes = graph_mask.nonzero().squeeze(1)
+            
+            # Get edges for this graph
+            graph_edge_mask = graph_mask[pyg_batch.edge_index[0]] & graph_mask[pyg_batch.edge_index[1]]
+            graph_edges = pyg_batch.edge_index[:, graph_edge_mask]
+            
+            # Remap to 0-based indices
+            node_mapping = {old_idx.item(): new_idx for new_idx, old_idx in enumerate(graph_nodes)}
+            if len(graph_edges) > 0:
+                remapped_edges = torch.zeros_like(graph_edges)
+                for i in range(graph_edges.size(1)):
+                    remapped_edges[0, i] = node_mapping[graph_edges[0, i].item()]
+                    remapped_edges[1, i] = node_mapping[graph_edges[1, i].item()]
+            else:
+                remapped_edges = torch.zeros((2, 0), dtype=torch.long)
+            
+            # Get node features (from pyg_batch.x if available, else create dummy)
+            N = graph_nodes.size(0)
+            if hasattr(pyg_batch, 'x') and pyg_batch.x is not None:
+                x_original = pyg_batch.x[graph_nodes].clone()
+            else:
+                # Fallback: create from graphormer x (reverse embedding - simplified)
+                x_original = torch.zeros(N, 1, dtype=torch.float)
+            
+            # Get edge scores for this graph
+            num_graph_edges = graph_edge_mask.sum().item()
+            graph_edge_scores = batch_edge_scores[edge_idx:edge_idx + num_graph_edges]
+            
+            # Create original graph
+            from torch_geometric.data import Data
+            original_graph = Data(
+                x=x_original,
+                edge_index=remapped_edges,
+                y=pyg_batch.y[graph_idx] if pyg_batch.y.dim() == 0 else pyg_batch.y[graph_idx]
+            )
+            
+            edge_scores_list.append(graph_edge_scores)
+            labels_list.append(original_graph.y)
+            original_graphs_list.append(original_graph)
+            edge_idx += num_graph_edges
     
     # Compute curve for each ratio
     print(f"\nComputing fidelity curve for {method}...")
@@ -129,15 +186,16 @@ def compute_fidelity_curve(model, loader, device, method='graphormer', ratios=np
     for ratio in tqdm(ratios, desc="Fidelity curve"):
         batch_accuracies = []
         
-        for i, (edge_scores, labels, graphormer_data, pyg_batch) in enumerate(
-            zip(edge_scores_list, labels_list, batched_data_list, pyg_batch_list)
+        for i, (edge_scores, label, original_graph) in enumerate(
+            zip(edge_scores_list, labels_list, original_graphs_list)
         ):
             num_edges = len(edge_scores)
             num_keep = int(num_edges * (1 - ratio))  # Keep bottom (1-ratio) edges
             
             if num_keep == 0:
                 # No edges - random prediction
-                batch_accuracies.append(1.0 / len(torch.unique(labels)))  # Random accuracy
+                num_classes = len(torch.unique(torch.stack([l if isinstance(l, torch.Tensor) else torch.tensor(l) for l in labels_list])))
+                batch_accuracies.append(1.0 / num_classes)
                 continue
             
             # Get indices of edges to keep (least important)
@@ -145,62 +203,93 @@ def compute_fidelity_curve(model, loader, device, method='graphormer', ratios=np
             edge_mask = torch.zeros(num_edges, dtype=torch.bool)
             edge_mask[keep_indices] = True
             
-            # Evaluate with modified edges
-            preds = evaluate_with_modified_edges(model, graphormer_data, pyg_batch, device, edge_mask)
-            batch_acc = (preds == labels).float().mean().item()
-            batch_accuracies.append(batch_acc)
+            # Evaluate with modified edges (process single graph)
+            preds = evaluate_with_modified_edges(model, [original_graph], device, [edge_mask], collator)
+            pred_label = preds[0].item() if len(preds) > 0 else 0
+            true_label = label.item() if isinstance(label, torch.Tensor) else label
+            batch_accuracies.append(float(pred_label == true_label))
         
         accuracies.append(np.mean(batch_accuracies))
     
-    return ratios, accuracies
+    return np.array(ratios), np.array(accuracies)
 
 
-def compute_insertion_curve(model, loader, device, method='graphormer', ratios=np.linspace(0, 1, 21)):
+def compute_insertion_curve(model, loader, device, method='graphormer', ratios=np.linspace(0, 1, 21), collator=None):
     """Compute insertion curve by adding edges."""
-    all_accuracies = []
-    
-    # Collect edge scores
+    # Use same graph extraction logic as deletion curve
     edge_scores_list = []
     labels_list = []
-    batched_data_list = []
-    pyg_batch_list = []
+    original_graphs_list = []
     
-    print("Collecting edge scores...")
+    print("Collecting edge scores and extracting graphs...")
     for batch in tqdm(loader, desc="Collecting"):
         graphormer_data = {k: v.to(device) for k, v in batch['graphormer_data'].items()}
         pyg_batch = batch['pyg_batch'].to(device)
         
-        if method == 'graphormer':
-            edge_scores = get_edge_scores_for_batch(model, graphormer_data, pyg_batch, device)
-            if edge_scores is None:
-                # Model doesn't have explainer (e.g., PureGraphormer), use random
-                edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
-        elif method == 'random':
-            edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
-        else:
-            edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
+        batch_size = pyg_batch.batch.max().item() + 1
+        batch_edge_scores = None
         
-        edge_scores_list.append(edge_scores)
-        labels_list.append(pyg_batch.y.cpu())
-        batched_data_list.append(graphormer_data)
-        pyg_batch_list.append(pyg_batch)
+        if method == 'graphormer':
+            batch_edge_scores = get_edge_scores_for_batch(model, graphormer_data, pyg_batch, device)
+            if batch_edge_scores is None:
+                batch_edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
+        elif method == 'random':
+            batch_edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
+        else:
+            batch_edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
+        
+        edge_idx = 0
+        for graph_idx in range(batch_size):
+            graph_mask = (pyg_batch.batch == graph_idx)
+            graph_nodes = graph_mask.nonzero().squeeze(1)
+            graph_edge_mask = graph_mask[pyg_batch.edge_index[0]] & graph_mask[pyg_batch.edge_index[1]]
+            graph_edges = pyg_batch.edge_index[:, graph_edge_mask]
+            
+            node_mapping = {old_idx.item(): new_idx for new_idx, old_idx in enumerate(graph_nodes)}
+            if len(graph_edges) > 0:
+                remapped_edges = torch.zeros_like(graph_edges)
+                for i in range(graph_edges.size(1)):
+                    remapped_edges[0, i] = node_mapping[graph_edges[0, i].item()]
+                    remapped_edges[1, i] = node_mapping[graph_edges[1, i].item()]
+            else:
+                remapped_edges = torch.zeros((2, 0), dtype=torch.long)
+            
+            N = graph_nodes.size(0)
+            if hasattr(pyg_batch, 'x') and pyg_batch.x is not None:
+                x_original = pyg_batch.x[graph_nodes].clone()
+            else:
+                x_original = torch.zeros(N, 1, dtype=torch.float)
+            
+            num_graph_edges = graph_edge_mask.sum().item()
+            graph_edge_scores = batch_edge_scores[edge_idx:edge_idx + num_graph_edges]
+            
+            from torch_geometric.data import Data
+            original_graph = Data(
+                x=x_original,
+                edge_index=remapped_edges,
+                y=pyg_batch.y[graph_idx] if pyg_batch.y.dim() == 0 else pyg_batch.y[graph_idx]
+            )
+            
+            edge_scores_list.append(graph_edge_scores)
+            labels_list.append(original_graph.y)
+            original_graphs_list.append(original_graph)
+            edge_idx += num_graph_edges
     
-    # Compute insertion curve
     print(f"\nComputing insertion curve for {method}...")
     accuracies = []
     
     for ratio in tqdm(ratios, desc="Insertion curve"):
         batch_accuracies = []
         
-        for i, (edge_scores, labels, graphormer_data, pyg_batch) in enumerate(
-            zip(edge_scores_list, labels_list, batched_data_list, pyg_batch_list)
+        for i, (edge_scores, label, original_graph) in enumerate(
+            zip(edge_scores_list, labels_list, original_graphs_list)
         ):
             num_edges = len(edge_scores)
             num_add = int(num_edges * ratio)  # Add top ratio edges
             
             if num_add == 0:
-                # Start with no edges - random prediction
-                batch_accuracies.append(1.0 / len(torch.unique(labels)))
+                num_classes = len(torch.unique(torch.stack([l if isinstance(l, torch.Tensor) else torch.tensor(l) for l in labels_list])))
+                batch_accuracies.append(1.0 / num_classes)
                 continue
             
             # Get indices of edges to add (most important)
@@ -208,14 +297,14 @@ def compute_insertion_curve(model, loader, device, method='graphormer', ratios=n
             edge_mask = torch.zeros(num_edges, dtype=torch.bool)
             edge_mask[add_indices] = True
             
-            # Evaluate with added edges
-            preds = evaluate_with_modified_edges(model, graphormer_data, pyg_batch, device, edge_mask)
-            batch_acc = (preds == labels).float().mean().item()
-            batch_accuracies.append(batch_acc)
+            preds = evaluate_with_modified_edges(model, [original_graph], device, [edge_mask], collator)
+            pred_label = preds[0].item() if len(preds) > 0 else 0
+            true_label = label.item() if isinstance(label, torch.Tensor) else label
+            batch_accuracies.append(float(pred_label == true_label))
         
         accuracies.append(np.mean(batch_accuracies))
     
-    return ratios, accuracies
+    return np.array(ratios), np.array(accuracies)
 
 
 def plot_fidelity_curves(results, output_dir):
@@ -374,12 +463,30 @@ def main():
     collator = GraphormerCollator()
     
     if args.dataset == 'synthetic':
-        print(f"Generating {args.n_test} synthetic test graphs...")
-        test_graphs = generate_synthetic_dataset(
-            n_graphs=args.n_test, 
-            motif_types=['house', 'cycle', 'star'],
-            base_nodes=20
-        )
+        # Check for cached dataset
+        import pickle
+        import hashlib
+        cache_key = f"synthetic_test_{args.n_test}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+        cache_file = f"data/.cache_{cache_hash}.pkl"
+        
+        if os.path.exists(cache_file):
+            print(f"Loading cached dataset from {cache_file}...")
+            with open(cache_file, 'rb') as f:
+                test_graphs = pickle.load(f)
+        else:
+            print(f"Generating {args.n_test} synthetic test graphs...")
+            test_graphs = generate_synthetic_dataset(
+                n_graphs=args.n_test, 
+                motif_types=['house', 'cycle', 'star'],
+                base_nodes=20
+            )
+            # Cache the dataset
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, 'wb') as f:
+                pickle.dump(test_graphs, f)
+            print(f"Cached dataset to {cache_file}")
+        
         test_loader = DataLoader(test_graphs, batch_size=args.batch_size, 
                                 shuffle=False, collate_fn=collator)
     elif args.dataset == 'ba2motif':
@@ -401,11 +508,11 @@ def main():
         print("Computing Graphormer Explainer curves...")
         print("="*60)
         del_ratios, del_accs = compute_fidelity_curve(model, test_loader, device, 
-                                                      method='graphormer', ratios=ratios)
+                                                      method='graphormer', ratios=ratios, collator=collator)
         results['deletion']['Graphormer Explainer'] = (del_ratios, del_accs)
         
         ins_ratios, ins_accs = compute_insertion_curve(model, test_loader, device,
-                                                       method='graphormer', ratios=ratios)
+                                                       method='graphormer', ratios=ratios, collator=collator)
         results['insertion']['Graphormer Explainer'] = (ins_ratios, ins_accs)
     
     # Random baseline
@@ -414,11 +521,11 @@ def main():
         print("Computing Random baseline curves...")
         print("="*60)
         del_ratios, del_accs = compute_fidelity_curve(model, test_loader, device,
-                                                      method='random', ratios=ratios)
+                                                      method='random', ratios=ratios, collator=collator)
         results['deletion']['Random'] = (del_ratios, del_accs)
         
         ins_ratios, ins_accs = compute_insertion_curve(model, test_loader, device,
-                                                       method='random', ratios=ratios)
+                                                       method='random', ratios=ratios, collator=collator)
         results['insertion']['Random'] = (ins_ratios, ins_accs)
     
     # Plot results

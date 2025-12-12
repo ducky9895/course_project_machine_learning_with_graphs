@@ -5,6 +5,7 @@ Experiment 1: Predictive Accuracy Comparison
 Compare prediction accuracy across:
 - Pure Graphormer
 - Graphormer + Explainer
+- Graphormer + Explainer + Regularization
 - GCN
 - GIN
 """
@@ -23,7 +24,7 @@ from model_v2 import PureGraphormer, GraphormerExplainer
 from baselines.gcn import create_gcn_model
 from baselines.gin import create_gin_model
 from data_utils import GraphormerCollator
-from dataset.datasets import BA2Motif, generate_synthetic_dataset
+from dataset.datasets import BA2Motif, MutagDataset, generate_synthetic_dataset
 from torch.utils.data import DataLoader
 from torch_geometric.data import DataLoader as PyGDataLoader
 
@@ -135,7 +136,7 @@ def evaluate_gnn_model(model, loader, device):
 def main():
     parser = argparse.ArgumentParser(description='Evaluate Predictive Accuracy')
     parser.add_argument('--dataset', type=str, default='synthetic',
-                       choices=['synthetic', 'ba2motif'])
+                       choices=['synthetic', 'ba2motif', 'mutag', 'all'])
     parser.add_argument('--data_dir', type=str, default='data/')
     parser.add_argument('--checkpoint_dir', type=str, default='chkpts/',
                        help='Directory with trained models')
@@ -168,13 +169,33 @@ def main():
         input_dim = 4  # Synthetic node features
     elif args.dataset == 'ba2motif':
         print("Loading BA-2Motif test dataset...")
-        test_dataset = BA2Motif(args.data_dir, mode='test')
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
-                                shuffle=False, collate_fn=collator)
-        # Use batch_size=1 for PyG to avoid batching issues with variable-sized graphs
-        pyg_test_loader = PyGDataLoader(test_dataset, batch_size=1, shuffle=False)
-        num_classes = 2
-        input_dim = test_dataset[0].x.size(1) if len(test_dataset) > 0 else 10
+        try:
+            test_dataset = BA2Motif(args.data_dir, mode='test')
+            test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                                    shuffle=False, collate_fn=collator)
+            pyg_test_loader = PyGDataLoader(test_dataset, batch_size=1, shuffle=False)
+            num_classes = 2
+            input_dim = test_dataset[0].x.size(1) if len(test_dataset) > 0 else 10
+        except Exception as e:
+            print(f"  Error loading BA2Motif: {e}")
+            print("  Skipping BA2Motif evaluation")
+            return {}
+    elif args.dataset == 'mutag':
+        print("Loading Mutag test dataset...")
+        try:
+            test_dataset = MutagDataset(args.data_dir, mode='test')
+            test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                                    shuffle=False, collate_fn=collator)
+            pyg_test_loader = PyGDataLoader(test_dataset, batch_size=1, shuffle=False)
+            num_classes = 2
+            input_dim = test_dataset[0].x.size(1) if len(test_dataset) > 0 else 10
+        except Exception as e:
+            print(f"  Error loading Mutag: {e}")
+            print("  Skipping Mutag evaluation")
+            return {}
+    else:
+        print(f"Unknown dataset: {args.dataset}")
+        return {}
     
     results = {}
     
@@ -226,16 +247,12 @@ def main():
     print("="*60)
     explainer_model_path = os.path.join(args.checkpoint_dir, 'graphormer_explainer', 'best_model.pt')
     if not os.path.exists(explainer_model_path):
-        # Try alternative paths
-        for alt_path in [
-            os.path.join(args.checkpoint_dir, 'synthetic_*', 'best_model.pt'),
-            os.path.join(args.checkpoint_dir, 'exp_graphormer_explainer', 'best_model.pt'),
-        ]:
-            import glob
-            matches = glob.glob(alt_path)
-            if matches:
-                explainer_model_path = matches[0]
-                break
+        # Try to find in subdirectories
+        import glob
+        matches = glob.glob(os.path.join(args.checkpoint_dir, 'graphormer_explainer', '*', 'best_model.pt'))
+        if matches:
+            explainer_model_path = matches[-1]  # Use most recent (last in sorted list)
+            print(f"  Found model in subdirectory: {explainer_model_path}")
     
     if os.path.exists(explainer_model_path):
         try:
@@ -251,17 +268,68 @@ def main():
                 num_classes=num_classes,
                 use_pattern_dict=False,
                 edge_hidden_dim=64,
-                classifier_hidden_dim=64
+                classifier_hidden_dim=64,
+                use_regularization=False  # No regularization for basic explainer
             ).to(device)
-            model.load_state_dict(torch.load(explainer_model_path, map_location=device), strict=False)
+            checkpoint = torch.load(explainer_model_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
             results['Graphormer + Explainer'] = evaluate_graphormer_model(model, test_loader, device)
             print(f"  Accuracy: {results['Graphormer + Explainer']['accuracy']:.4f}")
         except Exception as e:
             print(f"  Error loading model: {e}")
+            import traceback
+            traceback.print_exc()
             results['Graphormer + Explainer'] = {'accuracy': 0.0, 'error': str(e)}
     else:
         print(f"  Model not found at {explainer_model_path}")
         results['Graphormer + Explainer'] = {'accuracy': 0.0, 'note': 'Model not found'}
+    
+    # 2.5. Graphormer + Explainer + Regularization
+    print("\n" + "="*60)
+    print("2.5. Evaluating Graphormer + Explainer + Regularization...")
+    print("="*60)
+    reg_model_path = os.path.join(args.checkpoint_dir, 'graphormer_explainer_reg', 'best_model.pt')
+    if not os.path.exists(reg_model_path):
+        # Try to find in subdirectories
+        import glob
+        matches = glob.glob(os.path.join(args.checkpoint_dir, 'graphormer_explainer_reg', '*', 'best_model.pt'))
+        if matches:
+            reg_model_path = matches[-1]  # Use most recent
+            print(f"  Found model in subdirectory: {reg_model_path}")
+    
+    if os.path.exists(reg_model_path):
+        try:
+            model = GraphormerExplainer(
+                num_encoder_layers=4,
+                embedding_dim=128,
+                ffn_embedding_dim=128,
+                num_attention_heads=4,
+                num_in_degree=64,
+                num_out_degree=64,
+                num_spatial=64,
+                num_edges=512,
+                num_classes=num_classes,
+                use_pattern_dict=False,
+                edge_hidden_dim=64,
+                classifier_hidden_dim=64,
+                use_regularization=True  # With regularization
+            ).to(device)
+            checkpoint = torch.load(reg_model_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
+            results['Graphormer + Explainer + Reg'] = evaluate_graphormer_model(model, test_loader, device)
+            print(f"  Accuracy: {results['Graphormer + Explainer + Reg']['accuracy']:.4f}")
+        except Exception as e:
+            print(f"  Error loading model: {e}")
+            results['Graphormer + Explainer + Reg'] = {'accuracy': 0.0, 'error': str(e)}
+    else:
+        print(f"  Model not found at {reg_model_path}")
+        results['Graphormer + Explainer + Reg'] = {'accuracy': 0.0, 'note': 'Model not found'}
     
     # 3. GCN
     print("\n" + "="*60)
@@ -340,7 +408,10 @@ def main():
     # Save to CSV
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     df = pd.DataFrame(results).T
-    df.to_csv(args.output)
+    df.index.name = 'Model'
+    df.reset_index(inplace=True)
+    df['Dataset'] = args.dataset  # Add dataset column
+    df.to_csv(args.output, index=False)
     print(f"\nResults saved to {args.output}")
     
     return results

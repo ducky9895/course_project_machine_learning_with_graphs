@@ -18,3 +18,4 @@ pip install dgl -f https://data.dgl.ai/wheels/cu121/repo.html
 cd fairseq
 pip install -e . 
 python setup.py build_ext --inplace
+fi de l
