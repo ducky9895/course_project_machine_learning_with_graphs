@@ -109,7 +109,7 @@ def compute_fidelity_curve(model, loader, device, method='graphormer', ratios=np
             edge_scores = get_edge_scores_for_batch(model, graphormer_data, pyg_batch, device)
             if edge_scores is None:
                 # Model doesn't have explainer (e.g., PureGraphormer), use random
-                print("Warning: Model doesn't have explainer, using random scores")
+                print(f"  Warning: Model doesn't have explainer (batch {len(edge_scores_list)}), using random scores")
                 edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
         elif method == 'random':
             edge_scores = get_random_scores(pyg_batch.edge_index.size(1))
@@ -291,6 +291,10 @@ def main():
         embedding_dim = config.get('embedding_dim', 128)
         num_in_degree = config.get('num_in_degree', 64)
         num_out_degree = config.get('num_out_degree', 64)
+        num_spatial = config.get('num_spatial', 64)
+        num_edges = config.get('num_edges', 512)
+        ffn_embedding_dim = config.get('ffn_embedding_dim', 128)
+        edge_hidden_dim = config.get('edge_hidden_dim', 64)
         classifier_hidden_dim = config.get('classifier_hidden_dim', 64)
     else:
         # Try to infer from path
@@ -302,8 +306,13 @@ def main():
         num_classes = 3 if args.dataset == 'synthetic' else 2
         num_encoder_layers = 4
         embedding_dim = 128
+        ffn_embedding_dim = 128
+        num_attention_heads = 4
         num_in_degree = 64  # Default used in training
         num_out_degree = 64
+        num_spatial = 64
+        num_edges = 512
+        edge_hidden_dim = 64
         classifier_hidden_dim = 64
     
     # Create appropriate model
@@ -312,8 +321,12 @@ def main():
         model = PureGraphormer(
             num_encoder_layers=num_encoder_layers,
             embedding_dim=embedding_dim,
+            ffn_embedding_dim=ffn_embedding_dim,
+            num_attention_heads=num_attention_heads,
             num_in_degree=num_in_degree,
             num_out_degree=num_out_degree,
+            num_spatial=num_spatial,
+            num_edges=num_edges,
             num_classes=num_classes,
             classifier_hidden_dim=classifier_hidden_dim
         ).to(device)
@@ -322,10 +335,15 @@ def main():
         model = GraphormerExplainer(
             num_encoder_layers=num_encoder_layers,
             embedding_dim=embedding_dim,
+            ffn_embedding_dim=ffn_embedding_dim,
+            num_attention_heads=num_attention_heads,
             num_in_degree=num_in_degree,
             num_out_degree=num_out_degree,
+            num_spatial=num_spatial,
+            num_edges=num_edges,
             num_classes=num_classes,
             use_pattern_dict=False,
+            edge_hidden_dim=edge_hidden_dim,
             classifier_hidden_dim=classifier_hidden_dim
         ).to(device)
     
@@ -346,7 +364,11 @@ def main():
         pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
         model_dict.update(pretrained_dict)
         model.load_state_dict(model_dict)
-        print(f"Loaded {len(pretrained_dict)}/{len(state_dict)} parameters")
+        loaded_ratio = len(pretrained_dict) / len(state_dict) if len(state_dict) > 0 else 0
+        print(f"Loaded {len(pretrained_dict)}/{len(state_dict)} parameters ({loaded_ratio:.1%})")
+        if loaded_ratio < 0.5:
+            print("WARNING: Less than 50% of parameters loaded. Model may not work correctly!")
+            raise RuntimeError(f"Failed to load model: only {loaded_ratio:.1%} parameters matched")
     
     # Create test dataset
     collator = GraphormerCollator()

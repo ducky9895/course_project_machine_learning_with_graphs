@@ -73,12 +73,50 @@ def evaluate_gnn_model(model, loader, device):
     
     with torch.no_grad():
         for batch in loader:
-            batch = batch.to(device)
-            logits = model(batch.x, batch.edge_index, batch.batch)
-            preds = logits.argmax(dim=1)
-            
-            all_preds.append(preds.cpu())
-            all_labels.append(batch.y.cpu())
+            try:
+                batch = batch.to(device)
+                
+                # Ensure batch attribute exists (PyG DataLoader should create this, but check)
+                if not hasattr(batch, 'batch') or batch.batch is None:
+                    # If batch_size=1, create batch index manually
+                    if batch.x.size(0) > 0:
+                        batch.batch = torch.zeros(batch.x.size(0), dtype=torch.long, device=device)
+                    else:
+                        print(f"  Warning: Empty graph, skipping")
+                        continue
+                
+                # Verify node features have consistent dimension
+                if batch.x.dim() != 2:
+                    print(f"  Warning: Unexpected node feature shape {batch.x.shape}, skipping")
+                    continue
+                
+                # Forward pass
+                logits = model(batch.x, batch.edge_index, batch.batch)
+                
+                # Handle single graph vs batched graphs
+                if logits.dim() == 1:
+                    logits = logits.unsqueeze(0)
+                
+                preds = logits.argmax(dim=1)
+                
+                all_preds.append(preds.cpu())
+                all_labels.append(batch.y.cpu())
+            except Exception as e:
+                print(f"  Warning: Error processing batch: {e}")
+                import traceback
+                traceback.print_exc()
+                # Skip this batch
+                continue
+    
+    if len(all_preds) == 0:
+        return {
+            'accuracy': 0.0,
+            'f1_macro': 0.0,
+            'f1_micro': 0.0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'error': 'No batches processed successfully'
+        }
     
     all_preds = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
@@ -123,7 +161,9 @@ def main():
         )
         test_loader = DataLoader(test_graphs, batch_size=args.batch_size,
                                 shuffle=False, collate_fn=collator)
-        pyg_test_loader = PyGDataLoader(test_graphs, batch_size=args.batch_size, shuffle=False)
+        # Use batch_size=1 for PyG to avoid batching issues with variable-sized graphs
+        # PyG can batch variable-sized graphs, but batch_size=1 is safest
+        pyg_test_loader = PyGDataLoader(test_graphs, batch_size=1, shuffle=False)
         num_classes = 3
         input_dim = 4  # Synthetic node features
     elif args.dataset == 'ba2motif':
@@ -131,7 +171,8 @@ def main():
         test_dataset = BA2Motif(args.data_dir, mode='test')
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
                                 shuffle=False, collate_fn=collator)
-        pyg_test_loader = PyGDataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+        # Use batch_size=1 for PyG to avoid batching issues with variable-sized graphs
+        pyg_test_loader = PyGDataLoader(test_dataset, batch_size=1, shuffle=False)
         num_classes = 2
         input_dim = test_dataset[0].x.size(1) if len(test_dataset) > 0 else 10
     
@@ -141,16 +182,35 @@ def main():
     print("\n" + "="*60)
     print("1. Evaluating Pure Graphormer...")
     print("="*60)
+    # Try direct path first
     pure_model_path = os.path.join(args.checkpoint_dir, 'pure_graphormer', 'best_model.pt')
+    if not os.path.exists(pure_model_path):
+        # Try to find in subdirectories
+        import glob
+        matches = glob.glob(os.path.join(args.checkpoint_dir, 'pure_graphormer', '*', 'best_model.pt'))
+        if matches:
+            pure_model_path = matches[0]  # Use most recent (last in sorted list)
+            print(f"  Found model in subdirectory: {pure_model_path}")
+    
     if os.path.exists(pure_model_path):
         try:
             model = PureGraphormer(
                 num_encoder_layers=4,
                 embedding_dim=128,
+                ffn_embedding_dim=128,
+                num_attention_heads=4,
+                num_in_degree=64,
+                num_out_degree=64,
+                num_spatial=64,
+                num_edges=512,
                 num_classes=num_classes,
                 classifier_hidden_dim=64
             ).to(device)
-            model.load_state_dict(torch.load(pure_model_path, map_location=device))
+            checkpoint = torch.load(pure_model_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
             results['Pure Graphormer'] = evaluate_graphormer_model(model, test_loader, device)
             print(f"  Accuracy: {results['Pure Graphormer']['accuracy']:.4f}")
         except Exception as e:
@@ -182,8 +242,15 @@ def main():
             model = GraphormerExplainer(
                 num_encoder_layers=4,
                 embedding_dim=128,
+                ffn_embedding_dim=128,
+                num_attention_heads=4,
+                num_in_degree=64,
+                num_out_degree=64,
+                num_spatial=64,
+                num_edges=512,
                 num_classes=num_classes,
                 use_pattern_dict=False,
+                edge_hidden_dim=64,
                 classifier_hidden_dim=64
             ).to(device)
             model.load_state_dict(torch.load(explainer_model_path, map_location=device), strict=False)
@@ -204,11 +271,20 @@ def main():
     if os.path.exists(gcn_model_path):
         try:
             gcn_model = create_gcn_model(input_dim, hidden_dim=64, num_classes=num_classes, num_layers=2).to(device)
-            gcn_model.load_state_dict(torch.load(gcn_model_path, map_location=device))
+            checkpoint = torch.load(gcn_model_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                gcn_model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                gcn_model.load_state_dict(checkpoint)
             results['GCN'] = evaluate_gnn_model(gcn_model, pyg_test_loader, device)
-            print(f"  Accuracy: {results['GCN']['accuracy']:.4f}")
+            if 'error' not in results['GCN']:
+                print(f"  Accuracy: {results['GCN']['accuracy']:.4f}")
+            else:
+                print(f"  Error: {results['GCN'].get('error', 'Unknown error')}")
         except Exception as e:
-            print(f"  Error loading GCN: {e}")
+            print(f"  Error loading/evaluating GCN: {e}")
+            import traceback
+            traceback.print_exc()
             results['GCN'] = {'accuracy': 0.0, 'error': str(e)}
     else:
         print(f"  GCN model not found at {gcn_model_path}")
@@ -223,11 +299,20 @@ def main():
     if os.path.exists(gin_model_path):
         try:
             gin_model = create_gin_model(input_dim, hidden_dim=64, num_classes=num_classes, num_layers=2).to(device)
-            gin_model.load_state_dict(torch.load(gin_model_path, map_location=device))
+            checkpoint = torch.load(gin_model_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                gin_model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                gin_model.load_state_dict(checkpoint)
             results['GIN'] = evaluate_gnn_model(gin_model, pyg_test_loader, device)
-            print(f"  Accuracy: {results['GIN']['accuracy']:.4f}")
+            if 'error' not in results['GIN']:
+                print(f"  Accuracy: {results['GIN']['accuracy']:.4f}")
+            else:
+                print(f"  Error: {results['GIN'].get('error', 'Unknown error')}")
         except Exception as e:
-            print(f"  Error loading GIN: {e}")
+            print(f"  Error loading/evaluating GIN: {e}")
+            import traceback
+            traceback.print_exc()
             results['GIN'] = {'accuracy': 0.0, 'error': str(e)}
     else:
         print(f"  GIN model not found at {gin_model_path}")

@@ -153,17 +153,40 @@ def main():
     model = GraphormerExplainer(
         num_encoder_layers=4,
         embedding_dim=128,
+        ffn_embedding_dim=128,
+        num_attention_heads=4,
+        num_in_degree=64,
+        num_out_degree=64,
+        num_spatial=64,
+        num_edges=512,
         num_classes=num_classes,
         use_pattern_dict=False,
+        edge_hidden_dim=64,
         classifier_hidden_dim=64
     ).to(device)
     
+    checkpoint = torch.load(args.model_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+    
     try:
-        model.load_state_dict(torch.load(args.model_path, map_location=device), strict=False)
+        model.load_state_dict(state_dict, strict=False)
         print("Model loaded successfully")
     except Exception as e:
         print(f"Error loading model: {e}")
-        return
+        print("Attempting to load compatible parameters only...")
+        # Try loading only matching parameters
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        loaded_ratio = len(pretrained_dict) / len(state_dict) if len(state_dict) > 0 else 0
+        print(f"Loaded {len(pretrained_dict)}/{len(state_dict)} parameters ({loaded_ratio:.1%})")
+        if loaded_ratio < 0.5:
+            print("ERROR: Less than 50% of parameters loaded. Model will not work correctly!")
+            raise RuntimeError(f"Failed to load model: only {loaded_ratio:.1%} parameters matched")
     
     # Create dataset
     collator = GraphormerCollator()
@@ -215,7 +238,13 @@ def main():
                 
                 graph_edges = pyg_batch.edge_index[:, graph_edge_mask]
                 graph_scores = edge_scores[graph_edge_mask]
-                graph_gt = edge_gt[graph_edge_mask] if edge_gt is not None else None
+                # Ensure edge_gt is on same device as graph_edge_mask
+                if edge_gt is not None:
+                    if isinstance(edge_gt, torch.Tensor):
+                        edge_gt = edge_gt.to(device)
+                    graph_gt = edge_gt[graph_edge_mask]
+                else:
+                    graph_gt = None
                 
                 # Remap node indices to 0-based for this graph
                 unique_nodes = torch.unique(graph_edges)
