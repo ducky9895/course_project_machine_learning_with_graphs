@@ -24,4 +24,5 @@ CUDA_VISIBLE_DEVICES=0 fairseq-train \
 --encoder-ffn-embed-dim 80 \
 --encoder-attention-heads 8 \
 --max-epoch 10000 \
---save-dir ./ckpts
+--save-dir ./ckpts \
+--tensorboard-logdir ./ckpts/tensorboard
