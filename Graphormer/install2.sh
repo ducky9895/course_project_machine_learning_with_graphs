@@ -5,7 +5,6 @@
 
 # Replace the first section of install.sh with:
 pip install torch==2.2.0+cu121 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install cython  # Required for compiling .pyx files
 pip install lmdb
 pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 pip install torch-sparse -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
